@@ -23,7 +23,11 @@ static XPLMDataRef gGroundSpeedRef = NULL;
 static XPLMDataRef gTrueHeadingRef = NULL;
 static XPLMDataRef gPitchRef = NULL;
 static XPLMDataRef gRollRef = NULL;
+static XPLMDataRef gVerticalSpeedRef = NULL;
 static XPLMDataRef gFuelTotalRef = NULL;
+static XPLMDataRef gGearRef = NULL;
+static XPLMDataRef gOnGroundRef = NULL;
+static XPLMDataRef gAGLRef = NULL;
 
 // Configuration variables (with defaults)
 static char kTargetURL[256] = "http://localhost:5055/";
@@ -41,7 +45,11 @@ typedef struct {
     double pitch;
     double roll;
     double speed;       // knots converted to km/h after dataref read
+    double vs;           // Vertical speed in m/s
     double fuel;        // Total fuel in kg
+    double agl;
+    int gear;            // Gear position (0=up, 1=down)
+    int on_ground;          // 1 if aircraft is on ground, 0 if airborne
     time_t timestamp;   // Unix timestamp
 } PositionData;
 
@@ -50,6 +58,7 @@ static PositionData gPreviousPosition = {0};
 static PositionData gCurrentPosition = {0};
 static float gTimeSinceLastUpdate = 0.0f;
 static int sendAgain = 1;
+static int justStarted = 0;
 
 
 // Function to read configuration file
@@ -108,8 +117,12 @@ void readDataRefs(PositionData* position) {
     position->heading = XPLMGetDataf(gTrueHeadingRef);
     position->pitch = XPLMGetDataf(gPitchRef);
     position->roll = XPLMGetDataf(gRollRef);
-    position->speed = XPLMGetDataf(gGroundSpeedRef) * 1.94384; //knots to km/h
+    position->speed = XPLMGetDataf(gGroundSpeedRef) * 1.8520; //knots to km/h
+    position->vs = XPLMGetDataf(gVerticalSpeedRef);
     position->fuel = XPLMGetDataf(gFuelTotalRef);
+    position->agl = XPLMGetDataf(gAGLRef);
+    position->gear = (int)XPLMGetDataf(gGearRef);
+    position->on_ground = XPLMGetDatai(gOnGroundRef);
     position->timestamp = time(NULL);
 }
 
@@ -118,9 +131,19 @@ bool hasSignificantChange() {
     // Calculate changes in trajectory. Change more then 5m/s from direct flight is "significant"
 
     if ( gCurrentPosition.speed > kMinSpeedThreshold ) {
+        // Calculate changes in trajectory. Change more then 5m/s from direct flight is "significant"
         if ( abs(gLastSentPosition.heading - gCurrentPosition.heading) > (1000.0 / gCurrentPosition.speed / kMinUpdateInterval) )
             return true;
-        else 
+        //  Calculate changes in trajectory. Change more then 5m/s vertical is "significant"  
+        else if ( abs(gLastSentPosition.vs - gCurrentPosition.vs) > 5 ) 
+            return true;
+        // Update position of gear change is "significant"     
+        else if ( gLastSentPosition.gear != gCurrentPosition.gear )
+            return true;
+        // Up/touch of gear is "significant"     
+        else if ( gLastSentPosition.on_ground != gCurrentPosition.on_ground )
+            return true;
+        else
             return false;
     }
     return false;
@@ -183,25 +206,30 @@ void sendPositionData(const PositionData* data) {
 // Flight loop callback - volané pravidelne
 float flightLoopCallback(float inElapsedSinceLastCall, float inElapsedTimeSinceLastFlightLoop, int inCounter, void *inRefcon) {
 
-    // Update current position by reading all DataRefs
-    readDataRefs(&gCurrentPosition);
-    
     // Update time since last update
     gTimeSinceLastUpdate += inElapsedSinceLastCall;
     
     if (gTimeSinceLastUpdate >= kMinUpdateInterval) {
-        if (hasSignificantChange()) {
-            // Significant change detected, send previous position
+        // Update current position by reading all DataRefs
+        readDataRefs(&gCurrentPosition);
+        if (justStarted == 1) {
+            gPreviousPosition = gCurrentPosition;
+            if ( gCurrentPosition.speed > kMinSpeedThreshold ) { 
+                justStarted = 0;
+            }
+        } else if (hasSignificantChange()) {
+            // Significant change detected, send previous position and state
             sendPositionData(&gPreviousPosition);
             gLastSentPosition = gPreviousPosition;
+            gTimeSinceLastUpdate = 0.0f;
             sendAgain=true;
         } else if (gTimeSinceLastUpdate >= kMaxUpdateInterval || sendAgain ) {
             // Maximum interval reached, send current position
             sendPositionData(&gCurrentPosition);
             gLastSentPosition = gCurrentPosition;
+            gTimeSinceLastUpdate = 0.0f;
             sendAgain=false;
         }
-        gTimeSinceLastUpdate = 0.0f;
         gPreviousPosition = gCurrentPosition;
     }
     
@@ -218,6 +246,7 @@ PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc) {
     
     // Read configuration
     readConfiguration();
+    justStarted=1;
 
     // Initialize DataRefs
     gLatitudeRef = XPLMFindDataRef("sim/flightmodel/position/latitude");
@@ -227,12 +256,17 @@ PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc) {
     gTrueHeadingRef = XPLMFindDataRef("sim/flightmodel/position/true_psi");
     gPitchRef = XPLMFindDataRef("sim/flightmodel/position/theta");      // Pitch angle
     gRollRef = XPLMFindDataRef("sim/flightmodel/position/phi");         // Roll angle
+    gVerticalSpeedRef = XPLMFindDataRef("sim/flightmodel/position/vh_ind"); // Vertical speed in m/s
     gFuelTotalRef = XPLMFindDataRef("sim/flightmodel/weight/m_fuel");   // Total fuel in kg
+    gOnGroundRef = XPLMFindDataRef("sim/flightmodel/failures/onground_any");
+    gGearRef = XPLMFindDataRef("sim/flightmodel/gear/gear_handle");
+    gAGLRef = XPLMFindDataRef("sim/flightmodel/position/y_agl");
     
   // Check if all DataRefs are valid
     if (!gLatitudeRef || !gLongitudeRef || !gAltitudeRef || 
-        !gGroundSpeedRef || !gTrueHeadingRef || !gPitchRef || !gRollRef || !gFuelTotalRef) {
-        XPLMDebugString("Traccar Plugin: Error - Could not find all required DataRefs\n");
+        !gGroundSpeedRef || !gTrueHeadingRef || !gPitchRef || !gRollRef || !gFuelTotalRef ||
+        !gVerticalSpeedRef || !gOnGroundRef ) {
+        XPLMDebugString("Traccar Plugin 1.1: Error - Could not find all required DataRefs\n");
         return 0;
     }
  
